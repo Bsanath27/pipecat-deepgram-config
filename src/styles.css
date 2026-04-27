@@ -1,0 +1,52 @@
+:root {
+  color: #1f2933;
+  background:
+    radial-gradient(circle at 12% 8%, #ffe8cf 0%, rgba(255, 232, 207, 0) 42%),
+    radial-gradient(circle at 90% 10%, #d6f4f0 0%, rgba(214, 244, 240, 0) 35%),
+    radial-gradient(circle at 88% 88%, #e5ebff 0%, rgba(229, 235, 255, 0) 36%),
+    linear-gradient(165deg, #fffdf8 0%, #f8fafc 100%);
+  min-height: 100vh;
+}
+
+body {
+  margin: 0;
+  background: transparent;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.hero {
+  background: linear-gradient(145deg, rgba(255, 245, 232, 0.85), rgba(214, 244, 240, 0.95));
+  border-color: #d7e3ef;
+  box-shadow: 0 18px 38px rgba(16, 24, 40, 0.08);
+  animation: fade-up 380ms ease-out;
+}
+
+.mantine-Card-root {
+  box-shadow: 0 14px 28px rgba(16, 24, 40, 0.05);
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+
+.mantine-Card-root:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 20px 34px rgba(16, 24, 40, 0.08);
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 48em) {
+  .hero {
+    padding: 1rem;
+  }
+}
