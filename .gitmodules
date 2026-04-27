@@ -1,3 +1,3 @@
-[submodule "muontickets"]
-	path = muontickets
+[submodule "tickets/mt/muontickets"]
+	path = tickets/mt/muontickets
 	url = https://github.com/muonium-ai/muontickets.git
