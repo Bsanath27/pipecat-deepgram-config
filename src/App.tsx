@@ -9,6 +9,7 @@ import {
   Group,
   Paper,
   Progress,
+  SegmentedControl,
   Select,
   SimpleGrid,
   Stack,
@@ -25,10 +26,20 @@ import {
   IconMicrophone,
   IconPlayerStop,
   IconRefresh,
-  IconSparkles
+  IconSparkles,
+  IconWifi,
+  IconWifiOff
 } from '@tabler/icons-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { checkHealth, processAudio, translateText } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  PipecatHandlers,
+  PipecatSession,
+  PipecatStatus,
+  checkHealth,
+  getPipecatConfig,
+  processAudio,
+  translateText
+} from './api';
 
 const languageOptions = [
   { value: 'en', label: 'English' },
@@ -38,388 +49,569 @@ const languageOptions = [
   { value: 'fr', label: 'French' }
 ];
 
-export function App() {
-    const [isRecording, setIsRecording] = useState(false);
-    const [isProcessing, setIsProcessing] = useState(false);
-    const [isTranslating, setIsTranslating] = useState(false);
-  const [sourceText, setSourceText] = useState('');
-  const [translatedText, setTranslatedText] = useState('');
-    const [sourceLanguage, setSourceLanguage] = useState(import.meta.env.VITE_SOURCE_LANGUAGE || 'en');
-  const [targetLanguage, setTargetLanguage] = useState(import.meta.env.VITE_TARGET_LANGUAGE || 'hi');
-    const [statusMessage, setStatusMessage] = useState('Ready for recording');
-    const [errorMessage, setErrorMessage] = useState('');
-    const [warningMessage, setWarningMessage] = useState('');
-    const [latencyMs, setLatencyMs] = useState<number | null>(null);
-    const [healthState, setHealthState] = useState<{
-      ready: boolean;
-      deepgramModel: string;
-      openrouterModel: string;
-      hasDeepgramKey: boolean;
-      hasOpenrouterKey: boolean;
-    } | null>(null);
+type Mode = 'batch' | 'live';
 
-    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-    const mediaStreamRef = useRef<MediaStream | null>(null);
-    const audioChunksRef = useRef<Blob[]>([]);
+export function App() {
+  // ── Shared state ──────────────────────────────────────────────────────────
+  const [mode, setMode] = useState<Mode>('live');
+  const [sourceLanguage, setSourceLanguage] = useState(import.meta.env.VITE_SOURCE_LANGUAGE || 'en');
+  const [targetLanguage, setTargetLanguage] = useState(import.meta.env.VITE_TARGET_LANGUAGE || 'hi');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [healthState, setHealthState] = useState<{
+    ready: boolean;
+    deepgramModel: string;
+    openrouterModel: string;
+    hasDeepgramKey: boolean;
+    hasOpenrouterKey: boolean;
+  } | null>(null);
+
+  // ── Batch-mode state ──────────────────────────────────────────────────────
+  const [isRecording, setIsRecording] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [batchTranscript, setBatchTranscript] = useState('');
+  const [batchTranslation, setBatchTranslation] = useState('');
+  const [batchStatus, setBatchStatus] = useState('Ready for recording');
+  const [batchWarning, setBatchWarning] = useState('');
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+
+  // ── Live-mode state ───────────────────────────────────────────────────────
+  const [pipecatStatus, setPipecatStatus] = useState<PipecatStatus>('idle');
+  const [livePartial, setLivePartial] = useState('');
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [liveTranslation, setLiveTranslation] = useState('');
+  const sessionRef = useRef<PipecatSession | null>(null);
 
   const appTitle = import.meta.env.VITE_APP_TITLE || 'Rizerve Voice Console';
   const deepgramModel = import.meta.env.VITE_DEEPGRAM_MODEL || 'nova-2';
 
-  const pipelineStatus = useMemo(() => {
-      if (isRecording) {
-        return 'Recording';
+  // ── Derived labels ────────────────────────────────────────────────────────
+  const overallStatus = useMemo(() => {
+    if (mode === 'live') {
+      switch (pipecatStatus) {
+        case 'connecting': return 'Connecting';
+        case 'ready':      return 'Listening';
+        case 'error':      return 'Error';
+        case 'closed':     return 'Disconnected';
+        default:           return 'Idle';
       }
+    }
+    if (isRecording)  return 'Recording';
+    if (isProcessing) return 'Processing';
+    if (isTranslating) return 'Translating';
+    return 'Idle';
+  }, [mode, pipecatStatus, isRecording, isProcessing, isTranslating]);
 
-      if (isProcessing) {
-        return 'Processing';
-      }
+  const statusColor = useMemo(() => {
+    if (mode === 'live') {
+      if (pipecatStatus === 'ready')      return 'teal';
+      if (pipecatStatus === 'connecting') return 'orange';
+      if (pipecatStatus === 'error')      return 'red';
+      return 'gray';
+    }
+    if (isRecording)  return 'red';
+    if (isProcessing || isTranslating) return 'orange';
+    return 'teal';
+  }, [mode, pipecatStatus, isRecording, isProcessing, isTranslating]);
 
-      if (isTranslating) {
-        return 'Translating';
-      }
+  // ── Health check ──────────────────────────────────────────────────────────
+  const refreshHealth = async () => {
+    try {
+      const response = await checkHealth();
+      setHealthState({
+        ready: response.status === 'ok',
+        deepgramModel: response.config.deepgramModel,
+        openrouterModel: response.config.openrouterModel,
+        hasDeepgramKey: response.config.hasDeepgramKey,
+        hasOpenrouterKey: response.config.hasOpenrouterKey
+      });
+      setErrorMessage('');
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to reach backend API.');
+      setHealthState(null);
+    }
+  };
 
-      return 'Idle';
-    }, [isProcessing, isRecording, isTranslating]);
-
-    const statusColor = useMemo(() => {
-      if (isRecording) {
-        return 'red';
-      }
-
-      if (isProcessing || isTranslating) {
-        return 'orange';
-      }
-
-      return 'teal';
-    }, [isProcessing, isRecording, isTranslating]);
-
-    const cleanupStream = () => {
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-        mediaStreamRef.current = null;
-      }
+  useEffect(() => {
+    refreshHealth();
+    return () => {
+      cleanupBatchStream();
+      sessionRef.current?.stop();
     };
+  }, []);
 
-    const refreshHealth = async () => {
-      try {
-        const response = await checkHealth();
-        setHealthState({
-          ready: response.status === 'ok',
-          deepgramModel: response.config.deepgramModel,
-          openrouterModel: response.config.openrouterModel,
-          hasDeepgramKey: response.config.hasDeepgramKey,
-          hasOpenrouterKey: response.config.hasOpenrouterKey
-        });
-        setErrorMessage('');
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unable to reach backend API.';
-        setErrorMessage(message);
-        setHealthState(null);
+  // ── Batch helpers ─────────────────────────────────────────────────────────
+  const cleanupBatchStream = () => {
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaStreamRef.current = null;
+  };
+
+  const startRecording = async () => {
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setErrorMessage('Microphone access is not supported in this browser.');
+        return;
       }
-    };
+      setErrorMessage('');
+      setBatchWarning('');
+      setBatchStatus('Microphone active. Speak now.');
+      audioChunksRef.current = [];
 
-    useEffect(() => {
-      refreshHealth();
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
 
-      return () => {
-        cleanupStream();
-      };
-    }, []);
+      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      mediaRecorderRef.current = recorder;
 
-    const startRecording = async () => {
-      try {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          setErrorMessage('Microphone access is not supported in this browser.');
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+
+      recorder.onstop = async () => {
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        cleanupBatchStream();
+
+        if (blob.size === 0) {
+          setBatchWarning('No audio captured. Please try again.');
+          setIsRecording(false);
+          setBatchStatus('Ready for recording');
           return;
         }
 
-        setErrorMessage('');
-        setWarningMessage('');
-        setStatusMessage('Microphone active. Speak now.');
-        audioChunksRef.current = [];
-
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaStreamRef.current = stream;
-
-        const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-        mediaRecorderRef.current = recorder;
-
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            audioChunksRef.current.push(event.data);
-          }
-        };
-
-        recorder.onstop = async () => {
-          const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-          cleanupStream();
-
-          if (blob.size === 0) {
-            setWarningMessage('No audio captured. Please try again.');
-            setIsRecording(false);
-            setStatusMessage('Ready for recording');
-            return;
-          }
-
-          setIsRecording(false);
-          setIsProcessing(true);
-          setStatusMessage('Transcribing and translating...');
-
-          try {
-            const response = await processAudio({
-              audio: blob,
-              sourceLanguage,
-              targetLanguage
-            });
-
-            setSourceText(response.transcript || '');
-            setTranslatedText(response.translatedText || '');
-            setLatencyMs(response.latencyMs ?? null);
-            setWarningMessage(response.warning || '');
-            setStatusMessage('Completed. Review transcript and translation.');
-            setErrorMessage('');
-          } catch (error) {
-            const message = error instanceof Error ? error.message : 'Audio processing failed.';
-            setErrorMessage(message);
-            setStatusMessage('Request failed. Check API configuration.');
-          } finally {
-            setIsProcessing(false);
-          }
-        };
-
-        recorder.start();
-        setIsRecording(true);
-      } catch (error) {
-        cleanupStream();
         setIsRecording(false);
-        const message = error instanceof Error ? error.message : 'Microphone permission denied.';
-        setErrorMessage(message);
-        setStatusMessage('Unable to start recording');
-      }
-    };
+        setIsProcessing(true);
+        setBatchStatus('Transcribing and translating…');
 
-    const stopRecording = () => {
-      const recorder = mediaRecorderRef.current;
-      if (!recorder || recorder.state === 'inactive') {
-        return;
-      }
+        try {
+          const response = await processAudio({ audio: blob, sourceLanguage, targetLanguage });
+          setBatchTranscript(response.transcript || '');
+          setBatchTranslation(response.translatedText || '');
+          setLatencyMs(response.latencyMs ?? null);
+          setBatchWarning(response.warning || '');
+          setBatchStatus('Completed. Review transcript and translation.');
+          setErrorMessage('');
+        } catch (error) {
+          setErrorMessage(error instanceof Error ? error.message : 'Audio processing failed.');
+          setBatchStatus('Request failed. Check API configuration.');
+        } finally {
+          setIsProcessing(false);
+        }
+      };
 
-      recorder.stop();
-    };
-
-    const onTranslate = async () => {
-      if (!sourceText.trim()) {
-        setWarningMessage('Transcript is empty. Record audio or type text first.');
-        return;
+      recorder.start();
+      setIsRecording(true);
+    } catch (error) {
+      cleanupBatchStream();
+      setIsRecording(false);
+      setErrorMessage(error instanceof Error ? error.message : 'Microphone permission denied.');
+      setBatchStatus('Unable to start recording');
     }
+  };
 
-      setIsTranslating(true);
-      setErrorMessage('');
-      setWarningMessage('');
+  const stopRecording = () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === 'inactive') return;
+    recorder.stop();
+  };
 
-      try {
-        const response = await translateText({
-          text: sourceText,
-          sourceLanguage,
-          targetLanguage
-        });
-        setTranslatedText(response.translatedText);
-        setStatusMessage('Translation updated from OpenRouter.');
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Translation failed.';
-        setErrorMessage(message);
-        setStatusMessage('Translation failed');
-      } finally {
-        setIsTranslating(false);
+  const onTranslate = async () => {
+    if (!batchTranscript.trim()) {
+      setBatchWarning('Transcript is empty. Record audio or type text first.');
+      return;
+    }
+    setIsTranslating(true);
+    setErrorMessage('');
+    setBatchWarning('');
+    try {
+      const response = await translateText({ text: batchTranscript, sourceLanguage, targetLanguage });
+      setBatchTranslation(response.translatedText);
+      setBatchStatus('Translation updated from OpenRouter.');
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Translation failed.');
+      setBatchStatus('Translation failed');
+    } finally {
+      setIsTranslating(false);
     }
   };
 
   const onReset = () => {
-    setSourceText('');
-    setTranslatedText('');
-      setIsRecording(false);
-      setIsProcessing(false);
-      setIsTranslating(false);
-      setStatusMessage('Ready for recording');
-      setWarningMessage('');
-      setErrorMessage('');
-      setLatencyMs(null);
-      cleanupStream();
+    setBatchTranscript('');
+    setBatchTranslation('');
+    setIsRecording(false);
+    setIsProcessing(false);
+    setIsTranslating(false);
+    setBatchStatus('Ready for recording');
+    setBatchWarning('');
+    setErrorMessage('');
+    setLatencyMs(null);
+    cleanupBatchStream();
   };
 
+  // ── Live helpers ──────────────────────────────────────────────────────────
+  const startLive = useCallback(async () => {
+    setErrorMessage('');
+    setLivePartial('');
+    setLiveTranscript('');
+    setLiveTranslation('');
+
+    const handlers: PipecatHandlers = {
+      onStatusChange: (s) => setPipecatStatus(s),
+      onTranscript: (text, isFinal) => {
+        if (isFinal) {
+          setLiveTranscript((prev) => (prev ? prev + ' ' + text : text));
+          setLivePartial('');
+        } else {
+          setLivePartial(text);
+        }
+      },
+      onTranslation: (_src, translated) => {
+        setLiveTranslation((prev) => (prev ? prev + ' ' + translated : translated));
+      },
+      onError: (msg) => setErrorMessage(msg)
+    };
+
+    const session = new PipecatSession(handlers);
+    sessionRef.current = session;
+
+    try {
+      const cfg = await getPipecatConfig();
+      await session.start({
+        wsUrl: cfg.wsUrl,
+        sourceLanguage,
+        targetLanguage
+      });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Failed to start live session.');
+      setPipecatStatus('error');
+      sessionRef.current = null;
+    }
+  }, [sourceLanguage, targetLanguage]);
+
+  const stopLive = useCallback(() => {
+    sessionRef.current?.stop();
+    sessionRef.current = null;
+  }, []);
+
+  const onModeChange = (next: string) => {
+    if (next === mode) return;
+    // Tear down active sessions when switching
+    if (isRecording) stopRecording();
+    if (pipecatStatus === 'ready' || pipecatStatus === 'connecting') stopLive();
+    setMode(next as Mode);
+    setErrorMessage('');
+  };
+
+  const liveIsActive = pipecatStatus === 'ready' || pipecatStatus === 'connecting';
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
-      <Container size="lg" py="xl">
-        <Stack gap="lg">
-        <Paper className="hero" p="lg" withBorder>
+    <Container size="lg" py="xl">
+      <Stack gap="lg">
+        {/* Header */}
+        <Paper p="lg" withBorder>
           <Group justify="space-between" align="flex-start">
             <Stack gap={4}>
               <Title order={1}>{appTitle}</Title>
-                <Text c="dimmed">End-to-end local testing for microphone, Deepgram STT, and Qwen3 translation via OpenRouter.</Text>
+              <Text c="dimmed">
+                {mode === 'live'
+                  ? 'Live mode — Pipecat streams mic audio through Deepgram STT → OpenRouter translation in real time.'
+                  : 'Batch mode — Record a clip, then transcribe and translate via REST API.'}
+              </Text>
             </Stack>
-              <Badge color={statusColor} variant="light" size="lg">
-              {pipelineStatus}
-            </Badge>
+            <Badge color={statusColor} variant="light" size="lg">{overallStatus}</Badge>
           </Group>
         </Paper>
 
-          <SimpleGrid cols={{ base: 1, sm: 3 }}>
-            <Card withBorder padding="md">
-              <Stack gap={4}>
-                <Group gap="xs">
-                  <ThemeIcon size="sm" color="teal" variant="light">
-                    <IconCpu size={14} />
-                  </ThemeIcon>
-                  <Text fw={600}>Deepgram Model</Text>
-                </Group>
-                <Text>{healthState?.deepgramModel || deepgramModel}</Text>
-              </Stack>
-            </Card>
+        {/* Mode toggle */}
+        <SegmentedControl
+          fullWidth
+          value={mode}
+          onChange={onModeChange}
+          data={[
+            { label: 'Live (Pipecat)', value: 'live' },
+            { label: 'Batch (REST)', value: 'batch' }
+          ]}
+        />
 
-            <Card withBorder padding="md">
-              <Stack gap={4}>
-                <Group gap="xs">
-                  <ThemeIcon size="sm" color="orange" variant="light">
-                    <IconLanguage size={14} />
-                  </ThemeIcon>
-                  <Text fw={600}>OpenRouter Model</Text>
-                </Group>
-                <Text lineClamp={1}>{healthState?.openrouterModel || 'Not available'}</Text>
-              </Stack>
-            </Card>
-
-            <Card withBorder padding="md">
-              <Stack gap={4}>
-                <Group gap="xs">
-                  <ThemeIcon size="sm" color="blue" variant="light">
-                    <IconSparkles size={14} />
-                  </ThemeIcon>
-                  <Text fw={600}>Last Latency</Text>
-                </Group>
-                <Text>{latencyMs ? `${latencyMs} ms` : 'No run yet'}</Text>
-              </Stack>
-            </Card>
-          </SimpleGrid>
-
-          {errorMessage ? (
-            <Alert color="red" title="Action Required" icon={<IconAlertTriangle size={16} />}>
-              {errorMessage}
-            </Alert>
-          ) : null}
-
-          {warningMessage ? (
-            <Alert color="yellow" title="Notice" icon={<IconAlertTriangle size={16} />}>
-              {warningMessage}
-            </Alert>
-          ) : null}
-
-          <Alert color="teal" title="Current Status" icon={<IconCircleCheck size={16} />}>
-            {statusMessage}
-          </Alert>
-
-        <Card withBorder radius="md" padding="lg">
-          <Stack>
-            <Group justify="space-between">
-                <Text fw={600}>Recording Controls</Text>
-              <Text size="sm" c="dimmed">
-                Deepgram: {deepgramModel} | Source: {sourceLanguage}
-              </Text>
-            </Group>
-
-              <Grid>
-                <Grid.Col span={{ base: 12, sm: 6 }}>
-                  <Select
-                    label="Source language"
-                    value={sourceLanguage}
-                    onChange={(value) => setSourceLanguage(value || 'en')}
-                    data={languageOptions}
-                  />
-                </Grid.Col>
-                <Grid.Col span={{ base: 12, sm: 6 }}>
-                  <Select
-                    label="Target language"
-                    value={targetLanguage}
-                    onChange={(value) => setTargetLanguage(value || 'hi')}
-                    data={languageOptions.filter((option) => option.value !== sourceLanguage)}
-                  />
-                </Grid.Col>
-              </Grid>
-
-            <Group>
-                {isRecording ? (
-                  <Button leftSection={<IconPlayerStop size={16} />} onClick={stopRecording} color="red">
-                    Stop Recording
-                  </Button>
-                ) : (
-                  <Button
-                    leftSection={<IconMicrophone size={16} />}
-                    onClick={startRecording}
-                    color="teal"
-                    disabled={isProcessing || isTranslating}
-                  >
-                    Start Recording
-                  </Button>
-                )}
-
-                <Button onClick={refreshHealth} variant="default" disabled={isProcessing || isTranslating || isRecording}>
-                  Check API Health
-                </Button>
-
-              <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={onReset}>
-                Reset
-              </Button>
-            </Group>
-
-              {(isProcessing || isTranslating) && <Progress value={75} animated />}
-
+        {/* Info cards */}
+        <SimpleGrid cols={{ base: 1, sm: 3 }}>
+          <Card withBorder padding="md">
+            <Stack gap={4}>
               <Group gap="xs">
-                <Badge color={healthState?.hasDeepgramKey ? 'teal' : 'gray'} variant="light">
-                  Deepgram Key: {healthState?.hasDeepgramKey ? 'Loaded' : 'Missing'}
-                </Badge>
-                <Badge color={healthState?.hasOpenrouterKey ? 'teal' : 'gray'} variant="light">
-                  OpenRouter Key: {healthState?.hasOpenrouterKey ? 'Loaded' : 'Missing'}
-                </Badge>
+                <ThemeIcon size="sm" color="teal" variant="light"><IconCpu size={14} /></ThemeIcon>
+                <Text fw={600}>Deepgram Model</Text>
               </Group>
-          </Stack>
-        </Card>
-
-        <Card withBorder radius="md" padding="lg">
-          <Stack>
-            <Text fw={600}>Transcript (English)</Text>
-            <Textarea
-              value={sourceText}
-              onChange={(event) => setSourceText(event.currentTarget.value)}
-              minRows={5}
-              autosize
-              placeholder="Live transcript will appear here..."
-            />
-          </Stack>
-        </Card>
-
-        <Card withBorder radius="md" padding="lg">
-          <Stack>
-            <Group grow>
-              <Button
-                mt={25}
-                onClick={onTranslate}
-                color="ember"
-                leftSection={<IconSparkles size={16} />}
-                loading={isTranslating}
-                disabled={isProcessing || isRecording}
-              >
-                Translate Transcript
-              </Button>
-            </Group>
-
-            <Divider />
-
-            <Stack gap="xs">
-              <Text fw={600}>Translated output</Text>
-              <Paper withBorder radius="md" p="sm" mih={110}>
-                <Text>{translatedText || 'Translation will appear here once generated.'}</Text>
-              </Paper>
+              <Text>{healthState?.deepgramModel || deepgramModel}</Text>
             </Stack>
-          </Stack>
-        </Card>
+          </Card>
+
+          <Card withBorder padding="md">
+            <Stack gap={4}>
+              <Group gap="xs">
+                <ThemeIcon size="sm" color="orange" variant="light"><IconLanguage size={14} /></ThemeIcon>
+                <Text fw={600}>OpenRouter Model</Text>
+              </Group>
+              <Text lineClamp={1}>{healthState?.openrouterModel || 'Not available'}</Text>
+            </Stack>
+          </Card>
+
+          <Card withBorder padding="md">
+            <Stack gap={4}>
+              <Group gap="xs">
+                <ThemeIcon size="sm" color="blue" variant="light"><IconSparkles size={14} /></ThemeIcon>
+                <Text fw={600}>{mode === 'live' ? 'Pipeline' : 'Last Latency'}</Text>
+              </Group>
+              <Text>
+                {mode === 'live'
+                  ? pipecatStatus === 'ready' ? 'Streaming' : pipecatStatus
+                  : latencyMs ? `${latencyMs} ms` : 'No run yet'}
+              </Text>
+            </Stack>
+          </Card>
+        </SimpleGrid>
+
+        {/* Alerts */}
+        {errorMessage && (
+          <Alert color="red" title="Error" icon={<IconAlertTriangle size={16} />}>
+            {errorMessage}
+          </Alert>
+        )}
+
+        {/* ── LIVE MODE ───────────────────────────────────────────────── */}
+        {mode === 'live' && (
+          <>
+            <Card withBorder radius="md" padding="lg">
+              <Stack>
+                <Group justify="space-between">
+                  <Text fw={600}>Live Controls</Text>
+                  <Group gap="xs">
+                    <Badge
+                      color={healthState?.hasDeepgramKey ? 'teal' : 'gray'}
+                      variant="light"
+                    >
+                      Deepgram Key: {healthState?.hasDeepgramKey ? 'Loaded' : 'Missing'}
+                    </Badge>
+                    <Badge
+                      color={healthState?.hasOpenrouterKey ? 'teal' : 'gray'}
+                      variant="light"
+                    >
+                      OpenRouter Key: {healthState?.hasOpenrouterKey ? 'Loaded' : 'Missing'}
+                    </Badge>
+                  </Group>
+                </Group>
+
+                <Grid>
+                  <Grid.Col span={{ base: 12, sm: 6 }}>
+                    <Select
+                      label="Source language"
+                      value={sourceLanguage}
+                      onChange={(v) => setSourceLanguage(v || 'en')}
+                      data={languageOptions}
+                      disabled={liveIsActive}
+                    />
+                  </Grid.Col>
+                  <Grid.Col span={{ base: 12, sm: 6 }}>
+                    <Select
+                      label="Target language"
+                      value={targetLanguage}
+                      onChange={(v) => setTargetLanguage(v || 'hi')}
+                      data={languageOptions.filter((o) => o.value !== sourceLanguage)}
+                      disabled={liveIsActive}
+                    />
+                  </Grid.Col>
+                </Grid>
+
+                <Group>
+                  {!liveIsActive ? (
+                    <Button
+                      leftSection={<IconWifi size={16} />}
+                      onClick={startLive}
+                      color="teal"
+                    >
+                      Start Live Session
+                    </Button>
+                  ) : (
+                    <Button
+                      leftSection={<IconWifiOff size={16} />}
+                      onClick={stopLive}
+                      color="red"
+                    >
+                      Stop Live Session
+                    </Button>
+                  )}
+                  <Button
+                    variant="default"
+                    onClick={refreshHealth}
+                    disabled={liveIsActive}
+                  >
+                    Check API Health
+                  </Button>
+                </Group>
+
+                {pipecatStatus === 'connecting' && <Progress value={60} animated />}
+                {pipecatStatus === 'ready' && (
+                  <Alert color="teal" title="Pipeline active" icon={<IconCircleCheck size={16} />}>
+                    Mic is live — speak in {sourceLanguage.toUpperCase()}. Translation appears after each sentence pause.
+                  </Alert>
+                )}
+              </Stack>
+            </Card>
+
+            {/* Live transcript */}
+            <Card withBorder radius="md" padding="lg">
+              <Stack>
+                <Text fw={600}>Live Transcript ({sourceLanguage.toUpperCase()})</Text>
+                <Paper withBorder radius="md" p="sm" mih={110} bg="dark.9">
+                  <Text style={{ whiteSpace: 'pre-wrap' }}>
+                    {liveTranscript}
+                    {livePartial && (
+                      <Text span c="dimmed"> {livePartial}</Text>
+                    )}
+                    {!liveTranscript && !livePartial && (
+                      <Text c="dimmed">Transcript will stream here as you speak…</Text>
+                    )}
+                  </Text>
+                </Paper>
+              </Stack>
+            </Card>
+
+            {/* Live translation */}
+            <Card withBorder radius="md" padding="lg">
+              <Stack>
+                <Text fw={600}>Live Translation ({targetLanguage.toUpperCase()})</Text>
+                <Paper withBorder radius="md" p="sm" mih={110}>
+                  <Text style={{ whiteSpace: 'pre-wrap' }}>
+                    {liveTranslation || (
+                      <Text c="dimmed" span>
+                        Translation appears here after each sentence pause…
+                      </Text>
+                    )}
+                  </Text>
+                </Paper>
+              </Stack>
+            </Card>
+          </>
+        )}
+
+        {/* ── BATCH MODE ──────────────────────────────────────────────── */}
+        {mode === 'batch' && (
+          <>
+            {batchWarning && (
+              <Alert color="yellow" title="Notice" icon={<IconAlertTriangle size={16} />}>
+                {batchWarning}
+              </Alert>
+            )}
+
+            <Alert color="teal" title="Current Status" icon={<IconCircleCheck size={16} />}>
+              {batchStatus}
+            </Alert>
+
+            <Card withBorder radius="md" padding="lg">
+              <Stack>
+                <Group justify="space-between">
+                  <Text fw={600}>Recording Controls</Text>
+                  <Text size="sm" c="dimmed">
+                    Deepgram: {deepgramModel} | Source: {sourceLanguage}
+                  </Text>
+                </Group>
+
+                <Grid>
+                  <Grid.Col span={{ base: 12, sm: 6 }}>
+                    <Select
+                      label="Source language"
+                      value={sourceLanguage}
+                      onChange={(v) => setSourceLanguage(v || 'en')}
+                      data={languageOptions}
+                    />
+                  </Grid.Col>
+                  <Grid.Col span={{ base: 12, sm: 6 }}>
+                    <Select
+                      label="Target language"
+                      value={targetLanguage}
+                      onChange={(v) => setTargetLanguage(v || 'hi')}
+                      data={languageOptions.filter((o) => o.value !== sourceLanguage)}
+                    />
+                  </Grid.Col>
+                </Grid>
+
+                <Group>
+                  {isRecording ? (
+                    <Button leftSection={<IconPlayerStop size={16} />} onClick={stopRecording} color="red">
+                      Stop Recording
+                    </Button>
+                  ) : (
+                    <Button
+                      leftSection={<IconMicrophone size={16} />}
+                      onClick={startRecording}
+                      color="teal"
+                      disabled={isProcessing || isTranslating}
+                    >
+                      Start Recording
+                    </Button>
+                  )}
+                  <Button onClick={refreshHealth} variant="default" disabled={isProcessing || isTranslating || isRecording}>
+                    Check API Health
+                  </Button>
+                  <Button variant="default" leftSection={<IconRefresh size={16} />} onClick={onReset}>
+                    Reset
+                  </Button>
+                </Group>
+
+                {(isProcessing || isTranslating) && <Progress value={75} animated />}
+
+                <Group gap="xs">
+                  <Badge color={healthState?.hasDeepgramKey ? 'teal' : 'gray'} variant="light">
+                    Deepgram Key: {healthState?.hasDeepgramKey ? 'Loaded' : 'Missing'}
+                  </Badge>
+                  <Badge color={healthState?.hasOpenrouterKey ? 'teal' : 'gray'} variant="light">
+                    OpenRouter Key: {healthState?.hasOpenrouterKey ? 'Loaded' : 'Missing'}
+                  </Badge>
+                </Group>
+              </Stack>
+            </Card>
+
+            <Card withBorder radius="md" padding="lg">
+              <Stack>
+                <Text fw={600}>Transcript ({sourceLanguage.toUpperCase()})</Text>
+                <Textarea
+                  value={batchTranscript}
+                  onChange={(e) => setBatchTranscript(e.currentTarget.value)}
+                  minRows={5}
+                  autosize
+                  placeholder="Live transcript will appear here…"
+                />
+              </Stack>
+            </Card>
+
+            <Card withBorder radius="md" padding="lg">
+              <Stack>
+                <Group grow>
+                  <Button
+                    mt={25}
+                    onClick={onTranslate}
+                    color="orange"
+                    leftSection={<IconSparkles size={16} />}
+                    loading={isTranslating}
+                    disabled={isProcessing || isRecording}
+                  >
+                    Translate Transcript
+                  </Button>
+                </Group>
+
+                <Divider />
+
+                <Stack gap="xs">
+                  <Text fw={600}>Translated output ({targetLanguage.toUpperCase()})</Text>
+                  <Paper withBorder radius="md" p="sm" mih={110}>
+                    <Text>{batchTranslation || 'Translation will appear here once generated.'}</Text>
+                  </Paper>
+                </Stack>
+              </Stack>
+            </Card>
+          </>
+        )}
       </Stack>
     </Container>
   );

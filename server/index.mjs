@@ -159,6 +159,16 @@ async function translateWithOpenRouter(text, sourceLanguage, targetLanguage) {
   throw new Error(lastError || 'OpenRouter request failed for all configured models.');
 }
 
+app.get('/api/pipecat-config', (_req, res) => {
+  const port = Number(process.env.PIPECAT_PORT || '8788');
+  const host = process.env.PIPECAT_HOST === '0.0.0.0' ? 'localhost' : (process.env.PIPECAT_HOST || 'localhost');
+  res.json({
+    wsUrl: `ws://${host}:${port}`,
+    sampleRate: Number(process.env.PIPECAT_SAMPLE_RATE || '16000'),
+    channels: Number(process.env.PIPECAT_CHANNELS || '1')
+  });
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',

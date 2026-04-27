@@ -4,12 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm:dev:web\" \"npm:dev:api\"",
+    "dev": "concurrently \"npm:dev:web\" \"npm:dev:api\" \"npm:dev:pipecat\"",
     "dev:web": "vite",
     "dev:api": "node --env-file=.env server/index.mjs",
+    "dev:pipecat": "python server/pipecat_harness.py",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "start:api": "node --env-file=.env server/index.mjs"
+    "start:api": "node --env-file=.env server/index.mjs",
+    "start:pipecat": "python server/pipecat_harness.py"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",
